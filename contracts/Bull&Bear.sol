@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0
 
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.4;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
@@ -8,25 +8,32 @@ import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
-
-// Chainlink Imports
+import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
-// This import includes functions from both ./KeeperBase.sol and
-// ./interfaces/KeeperCompatibleInterface.sol
-import "@chainlink/contracts/src/v0.8/KeeperCompatible.sol";
+import "@chainlink/contracts/src/v0.8/AutomationCompatible.sol";
 
 // Dev imports. This only works on a local dev network
 // and will not work on any test or main livenets.
 import "hardhat/console.sol";
 
-contract BullBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable , KeeperCompatibleInterface{
+contract BullBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable , AutomationCompatibleInterface, VRFConsumerBaseV2{
     using Counters for Counters.Counter;
 
     Counters.Counter private _tokenIdCounter;
     uint256 public interval;
     uint256 public lastTimeStamp;
     AggregatorV3Interface public priceFeed;
+    VRFCoordinatorV2Interface COORDINATOR;
+    uint64 s_subscriptionId;
+    //goerli key hash
+    bytes32 keyHash=0x4b09e658ed251bcafeebbc69400383d49f344ace09b9576fe248bb02c003fe9f;
     int256 public currentPrice;
+
+    uint32 callbackGasLimit = 500000;
+    uint16 requestConfirmations = 3;
+    uint32 numWords = 1;
+
 
     // IPFS URIs for the dynamic nft graphics/metadata.
     // NOTE: These connect to my IPFS Companion node.
@@ -43,13 +50,28 @@ contract BullBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable , Keepe
     ];
 
     event TokenUpdated(string marketTrend);
+    event RequestSent(uint256 requestId, uint32 numWords);
+    event RequestFulfilled(uint256 requestId, uint256[] randomWords);
 
-    constructor(uint updateInterval,address _priceFeed) ERC721("Bull&Bear", "BBTK") { 
+    struct RequestStatus {
+        bool fulfilled; // whether the request has been successfully fulfilled
+        bool exists; // whether a requestId exists
+        uint256[] randomWords;
+    }
+    mapping(uint256 => RequestStatus) public s_requests;
+    
+
+    //past req
+    uint256[] public requestIds;
+    uint256 public lastRequestId;
+    constructor(uint updateInterval,address _priceFeed,uint64 subscriptionId) ERC721("Bull&Bear", "BBTK") VRFConsumerBaseV2(0x7a1BaC17Ccc5b313516C5E16fb24f7659aA5ebed){ 
         //set the keeper update interval
         interval=updateInterval;
         lastTimeStamp=block.timestamp;
         priceFeed = AggregatorV3Interface(_priceFeed);
         currentPrice=getLatestPrice();
+        COORDINATOR = VRFCoordinatorV2Interface(0x7a1BaC17Ccc5b313516C5E16fb24f7659aA5ebed);
+        s_subscriptionId = subscriptionId;
     }
 
     function safeMint(address to) public {
@@ -68,10 +90,7 @@ contract BullBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable , Keepe
         string memory defaultUri = bullUrisIpfs[0];
         _setTokenURI(tokenId, defaultUri);
 
-        console.log(
-            "DONE!!! minted token ",
-            tokenId,
-            " and assigned token url: ");
+      
             
     } 
 
@@ -86,39 +105,34 @@ contract BullBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable , Keepe
 
 
 
-    function checkUpkeep(bytes calldata /*checkData*/ )external view override returns (bool upkeepNeeded,bytes memory performData){
+    function checkUpkeep(bytes calldata /*checkData*/ )external view override returns (bool upkeepNeeded,bytes memory /*performData*/){
         upkeepNeeded=(block.timestamp-lastTimeStamp)>interval; 
     }
 
     function performUpkeep(bytes calldata /*perform Data */)external override {
         if((block.timestamp-lastTimeStamp)>interval ){
             lastTimeStamp=block.timestamp;
-            int latestPrice=getLatestPrice();
-t
-            if(latestPrice==currentPrice)return;
-            else if(latestPrice<currentPrice){
-                updateAllTokenUris("bear");
-            }
-            else if(latestPrice>currentPrice){
-                updateAllTokenUris("bull");
-            }
-            console.log("og");
-            currentPrice=latestPrice;
+             requestRandomness(); 
         }
     }
 
-    function updateAllTokenUris(string memory trend)internal{
-        if(compartStrings("bear",trend)){
-            for(uint i=0;i<_tokenIdCounter.current();i++){
-                _setTokenURI(i,bearUrisIpfs[0]);
-            }
-        }else{
-            for(uint i=0;i<_tokenIdCounter.current();i++){
-                _setTokenURI(i,bullUrisIpfs[0]);
-            }
-        }
-        emit TokenUpdated(trend);
-    }
+    
+    // function updateAllTokenUris(string memory trend)internal{
+    //     uint index=0;
+    //     if(compareStrings("bear",trend)){
+    //         for(uint i=0;i<_tokenIdCounter.current();i++){
+    //              index=(rand%bearUrisIpfs.length);
+    //             _setTokenURI(i,bearUrisIpfs[index]);
+    //         }
+    //     }else{
+    //         for(uint i=0;i<_tokenIdCounter.current();i++){
+    //              index=(rand%bullUrisIpfs.length);
+    //             _setTokenURI(i,bullUrisIpfs[index]);
+    //         }
+    //     }
+        
+    //     emit TokenUpdated(trend);
+    // }
 
 
     function getLatestPrice()public view returns(int256){
@@ -126,14 +140,56 @@ t
        return price;
     }
 
-    function compartStrings(string memory a,string memory b)internal pure returns (bool){
+    function compareStrings(string memory a,string memory b)internal pure returns (bool){
         return(keccak256(abi.encodePacked(a))==keccak256(abi.encodePacked(b)));
     }
 
+    function requestRandomness() internal{
+        uint requestId = COORDINATOR.requestRandomWords(
+            keyHash,
+            s_subscriptionId,
+            requestConfirmations,
+            callbackGasLimit,
+            numWords
+        );
+        lastRequestId=requestId;
+        s_requests[requestId] = RequestStatus({randomWords: new uint256[](0), exists: true, fulfilled: false});
+        requestIds.push(requestId);
+        emit RequestSent(requestId, numWords);
+    }
+
+    function fulfillRandomWords(uint256 _requestId, uint256[] memory _randomWords) internal override {
+        require(s_requests[_requestId].exists, "request not found");
+        s_requests[_requestId].fulfilled = true;
+        s_requests[_requestId].randomWords = _randomWords;
+        uint rand=_randomWords[0];
+        uint index=0;
+        int latestPrice=getLatestPrice();
+        if(latestPrice==currentPrice)return;
+        else if(latestPrice<currentPrice){
+            for(uint i=0;i<_tokenIdCounter.current();i++){
+                 index=(rand%bearUrisIpfs.length);
+                _setTokenURI(i,bearUrisIpfs[index]);
+            }
+        emit TokenUpdated("bear");
+        }
+        else if(latestPrice>currentPrice){
+               for(uint i=0;i<_tokenIdCounter.current();i++){
+                 index=(rand%bullUrisIpfs.length);
+                _setTokenURI(i,bullUrisIpfs[index]);
+            }
+             emit TokenUpdated("bull");
+        }
+        emit RequestFulfilled(_requestId, _randomWords);
+    }
+
+    function getRequestStatus(uint256 _requestId) public view returns (bool fulfilled, uint256[] memory randomWords) {
+        require(s_requests[_requestId].exists, "request not found");
+        RequestStatus memory request = s_requests[_requestId];
+        return (request.fulfilled, request.randomWords);
+    }
 
 
-
-    // The following functions are overrides required by Solidity.
     function _beforeTokenTransfer(
         address from,
         address to,
